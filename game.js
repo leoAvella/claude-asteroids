@@ -9,6 +9,7 @@ const H = 600;
 const keys = {};
 const justPressed = {};
 
+//events
 window.addEventListener('keydown', e => {
   justPressed[e.code] = !keys[e.code];
   keys[e.code] = true;
