@@ -8,9 +8,24 @@ const H = 600;
 // ── Input ─────────────────────────────────────────────────────────────────────
 const keys = {};
 const justPressed = {};
+let paused = false;
 
 //events
 window.addEventListener('keydown', e => {
+  // Pausa: Escape pausa, cualquier tecla despausa (sin disparar ni repetir)
+  if (paused) {
+    e.preventDefault();
+    if (e.repeat) return;
+    paused = false;
+    keys[e.code] = true;
+    justPressed[e.code] = false;
+    return;
+  }
+  if (e.code === 'Escape' && state !== 'gameover') {
+    if (!e.repeat) paused = true;
+    return;
+  }
+
   justPressed[e.code] = !keys[e.code];
   keys[e.code] = true;
   if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code))
@@ -133,6 +148,8 @@ class Ship {
     this.thrusting     = false;
     this.invincible    = 3;
     this.shootCooldown = 0;
+    this.tripleTimer   = 0;   // segundos restantes de disparo triple
+    this.shieldTimer   = 0;   // segundos restantes de escudo
     this.dead          = false;
   }
 
@@ -140,6 +157,8 @@ class Ship {
     if (this.dead) return;
     if (this.invincible    > 0) this.invincible    -= dt;
     if (this.shootCooldown > 0) this.shootCooldown -= dt;
+    if (this.tripleTimer   > 0) this.tripleTimer   -= dt;
+    if (this.shieldTimer   > 0) this.shieldTimer   -= dt;
 
     const ROT   = 3.5;   // rad/s
     const THRUST = 260;  // px/s²
@@ -166,11 +185,27 @@ class Ship {
     const NOSE = 21;
     const ox = this.x + Math.cos(this.angle) * NOSE;
     const oy = this.y + Math.sin(this.angle) * NOSE;
+    if (this.tripleTimer > 0) {
+      // Abanico de 3 balas
+      const SPREAD = 0.22;   // rad
+      return [-SPREAD, 0, SPREAD].map(d => new Bullet(ox, oy, this.angle + d));
+    }
     return [new Bullet(ox, oy, this.angle)];
   }
 
   draw() {
     if (this.dead) return;
+
+    // Escudo de energía (parpadea en el último segundo)
+    if (this.shieldTimer > 0 && (this.shieldTimer > 1 || Math.floor(this.shieldTimer * 10) % 2 === 0)) {
+      const pulse = 0.55 + 0.3 * Math.sin(performance.now() / 120);
+      ctx.strokeStyle = `rgba(120, 200, 255, ${pulse.toFixed(2)})`;
+      ctx.lineWidth   = 2;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, SHIELD_RADIUS, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
     // Parpadeo durante invencibilidad de reaparición
     if (this.invincible > 0 && Math.floor(this.invincible * 8) % 2 === 0) return;
 
@@ -236,11 +271,67 @@ class Particle {
   }
 }
 
+// ── Power-ups (disparo triple / escudo) ───────────────────────────────────────
+const TRIPLE_DURATION = 10;    // segundos de disparo triple
+const SHIELD_DURATION = 5;     // segundos de escudo (o hasta recibir un golpe)
+const SHIELD_RADIUS   = 24;    // radio del círculo de energía
+const POWERUP_CHANCE  = 0.15;  // probabilidad de soltarlo al destruir un asteroide (una vez por nivel)
+
+class PowerUp {
+  constructor(x, y, type) {
+    this.x  = x;
+    this.y  = y;
+    this.type = type;   // 'triple' | 'shield'
+    const angle = rand(0, Math.PI * 2);
+    this.vx = Math.cos(angle) * 25;
+    this.vy = Math.sin(angle) * 25;
+    this.radius = 11;
+    this.rot    = 0;
+    this.dead   = false;
+  }
+
+  update(dt) {
+    this.x = wrap(this.x + this.vx * dt, W);
+    this.y = wrap(this.y + this.vy * dt, H);
+    this.rot += 1.5 * dt;
+  }
+
+  draw() {
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth   = 1.5;
+    ctx.lineJoin    = 'round';
+
+    // Triángulo (triple) o hexágono (escudo) giratorio
+    const sides = this.type === 'shield' ? 6 : 3;
+    ctx.save();
+    ctx.rotate(this.rot);
+    ctx.beginPath();
+    for (let i = 0; i < sides; i++) {
+      const a = (i / sides) * Math.PI * 2;
+      ctx.lineTo(Math.cos(a) * this.radius, Math.sin(a) * this.radius);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
+
+    // Letra central
+    ctx.fillStyle    = '#fff';
+    ctx.font         = 'bold 10px monospace';
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(this.type === 'shield' ? 'E' : 'T', 0, 1);
+    ctx.restore();
+  }
+}
+
 // ── Estado del juego ──────────────────────────────────────────────────────────
-let ship, bullets, asteroids, particles;
+let ship, bullets, asteroids, particles, powerups;
 let score, lives, level;
 let state;      // 'playing' | 'dead' | 'gameover'
 let deadTimer;
+let powerupSpawned;   // el power-up solo aparece una vez por nivel
 
 function spawnAsteroids(count) {
   const SAFE_DIST = 130;
@@ -259,6 +350,8 @@ function initGame() {
   bullets   = [];
   asteroids = [];
   particles = [];
+  powerups  = [];
+  powerupSpawned = false;
   score  = 0;
   lives  = 3;
   level  = 1;
@@ -270,6 +363,8 @@ function nextLevel() {
   level++;
   bullets   = [];
   particles = [];
+  powerups  = [];
+  powerupSpawned = false;
   ship.reset();
   spawnAsteroids(3 + level);
 }
@@ -292,6 +387,8 @@ function killShip() {
 
 // ── Update ────────────────────────────────────────────────────────────────────
 function update(dt) {
+  if (paused) return;
+
   if (state === 'gameover') {
     if (pressed('Space')) initGame();
     particles.forEach(p => p.update(dt));
@@ -304,6 +401,7 @@ function update(dt) {
     particles.forEach(p => p.update(dt));
     particles = particles.filter(p => !p.dead);
     asteroids.forEach(a => a.update(dt));
+    powerups.forEach(p => p.update(dt));
     if (deadTimer <= 0) { state = 'playing'; ship.reset(); }
     return;
   }
@@ -317,6 +415,7 @@ function update(dt) {
   bullets.forEach(b => b.update(dt));
   asteroids.forEach(a => a.update(dt));
   particles.forEach(p => p.update(dt));
+  powerups.forEach(p => p.update(dt));
 
   bullets   = bullets.filter(b => !b.dead);
   particles = particles.filter(p => !p.dead);
@@ -331,17 +430,42 @@ function update(dt) {
         score += POINTS[a.size];
         explode(a.x, a.y, a.size * 5);
         newAsteroids.push(...a.split());
+        if (!powerupSpawned && Math.random() < POWERUP_CHANCE) {
+          powerups.push(new PowerUp(a.x, a.y, Math.random() < 0.5 ? 'triple' : 'shield'));
+          powerupSpawned = true;
+        }
       }
     }
   }
   asteroids = asteroids.filter(a => !a.dead).concat(newAsteroids);
   bullets   = bullets.filter(b => !b.dead);
 
+  // Nave vs power-up
+  for (const p of powerups) {
+    if (dist(ship, p) < ship.radius + p.radius) {
+      p.dead = true;
+      if (p.type === 'shield') ship.shieldTimer = SHIELD_DURATION;
+      else                     ship.tripleTimer = TRIPLE_DURATION;
+    }
+  }
+  powerups = powerups.filter(p => !p.dead);
+
   // Nave vs asteroide
   if (ship.invincible <= 0) {
+    const shielded = ship.shieldTimer > 0;
+    const hitR     = shielded ? SHIELD_RADIUS : ship.radius;
     for (const a of asteroids) {
-      if (dist(ship, a) < ship.radius + a.radius * 0.82) {
-        killShip();
+      if (dist(ship, a) < hitR + a.radius * 0.82) {
+        if (shielded) {
+          // El escudo absorbe el impacto: se rompe y el asteroide se parte
+          ship.shieldTimer = 0;
+          ship.invincible  = 1;   // margen para escapar de los fragmentos
+          a.dead = true;
+          explode(a.x, a.y, a.size * 5);
+          asteroids = asteroids.filter(x => !x.dead).concat(a.split());
+        } else {
+          killShip();
+        }
         break;
       }
     }
@@ -382,6 +506,17 @@ function drawHUD() {
   for (let i = 0; i < lives; i++)
     drawLifeIcon(W - 16 - i * 22, 18);
 
+  // Power-ups activos (inferior izquierda)
+  if (state === 'playing') {
+    ctx.textAlign = 'left';
+    let y = H - 16;
+    if (ship.tripleTimer > 0) {
+      ctx.fillText(`TRIPLE ${Math.ceil(ship.tripleTimer)}s`, 14, y);
+      y -= 20;
+    }
+    if (ship.shieldTimer > 0)
+      ctx.fillText(`ESCUDO ${Math.ceil(ship.shieldTimer)}s`, 14, y);
+  }
 }
 
 function drawOverlay(title, sub) {
@@ -400,6 +535,7 @@ function draw() {
 
   particles.forEach(p => p.draw());
   asteroids.forEach(a => a.draw());
+  powerups.forEach(p => p.draw());
   bullets.forEach(b => b.draw());
   ship.draw();
 
@@ -407,6 +543,8 @@ function draw() {
 
   if (state === 'gameover')
     drawOverlay('GAME OVER', `PUNTAJE: ${score}   —   ESPACIO PARA REINICIAR`);
+  else if (paused)
+    drawOverlay('PAUSA', 'PULSA CUALQUIER TECLA PARA CONTINUAR');
 }
 
 // ── Loop principal ────────────────────────────────────────────────────────────
